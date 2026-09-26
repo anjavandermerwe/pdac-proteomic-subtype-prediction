@@ -2,9 +2,11 @@
 
 This repository contains three complementary classification pipelines developed for tumour subtype prediction, using proteomic and histopathology (whole-slide image) features. All pipelines fix `random_state=42` for reproducibility and fit any preprocessing/feature-selection step only on training folds to avoid leakage.
 
+The proteomic pipelines are run in sequence: the nested CV pipeline (Section 1) discovers which proteins are worth using, and those proteins are then locked in as the fixed panels evaluated in Section 2.
+
 ## Contents
-1. [Fixed Protein Panel Classification](#1-fixed-protein-panel-classification)
-2. [Nested CV Feature Selection Pipeline](#2-nested-cv-feature-selection-pipeline)
+1. [Nested CV Feature Selection Pipeline](#1-nested-cv-feature-selection-pipeline)
+2. [Fixed Protein Panel Classification](#2-fixed-protein-panel-classification)
 3. [Histopathology Slide/Patient-Level Classification](#3-histopathology-slidepatient-level-classification)
 4. [Shared Utility: Bootstrap ROC-AUC Confidence Intervals](#shared-utility-bootstrap-roc-auc-confidence-intervals)
 
@@ -20,256 +22,16 @@ pip install pandas numpy scikit-learn xgboost matplotlib seaborn imbalanced-lear
 .
 ├── utils/
 │   └── bootstrap_ci.py                       # shared bootstrap CI helpers (see below)
-├── protein_panel_classification.py           # Section 1
-├── nested_cv_feature_selection.py            # Section 2
+├── nested_cv_feature_selection.py            # Section 1
+├── protein_panel_classification.py           # Section 2
 └── histopathology_slide_classification.py    # Section 3
 ```
 
 ---
 
-## 1. Fixed Protein Panel Classification
+## 1. Nested CV Feature Selection Pipeline
 
-Evaluates two **pre-selected** protein panels against five classifiers, using flat (non-nested) cross-validation.
-
-**Data:** `tumour_zscore_clusters.csv`; target is `Subtype` or `cluster`, label-encoded.
-
-**Feature panels:**
-
-| Panel | Proteins |
-|-------|----------|
-| SFS | F8VZS0, Q13885, O95479 |
-| RFE | Q9NR12, Q04206, Q8NCW5 |
-
-**Classifiers:** Random Forest, SVM (RBF), XGBoost, Logistic Regression, MLP — all with balanced class weights where supported.
-
-**Cross-validation:** 5-fold `StratifiedKFold` (`shuffle=True`). Each classifier is trained/evaluated per fold; predictions are aggregated across folds.
-
-**Metrics:** balanced accuracy (per fold), aggregated accuracy, weighted precision/recall/F1, aggregated ROC-AUC (binary or weighted OvR) with a 95% bootstrap CI (1,000 resamples).
-
-<details>
-<summary>Show code — <code>protein_panel_classification.py</code></summary>
-
-```python
-"""
-Fixed protein panel classification.
-
-Compares two pre-selected protein panels (SFS, RFE) across five
-classifiers using flat 5-fold stratified cross-validation.
-"""
-
-import os
-import warnings
-
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.svm import SVC
-from sklearn.linear_model import LogisticRegression
-from sklearn.neural_network import MLPClassifier
-from sklearn.model_selection import StratifiedKFold
-from sklearn.preprocessing import LabelEncoder, label_binarize
-from sklearn.metrics import (
-    classification_report,
-    balanced_accuracy_score,
-    confusion_matrix,
-    roc_auc_score,
-    accuracy_score,
-    precision_recall_fscore_support,
-    roc_curve,
-    auc,
-)
-from xgboost import XGBClassifier
-
-from utils.bootstrap_ci import bootstrap_binary_auc_ci, bootstrap_multiclass_auc_ci
-
-warnings.filterwarnings("ignore")
-
-OUTPUT_DIR = "results"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-FEATURE_GROUPS = {
-    "SFS": ["F8VZS0", "Q13885", "O95479"],
-    "RFE": ["Q9NR12", "Q04206", "Q8NCW5"],
-}
-
-# ── Load data ────────────────────────────────────────────────────
-df = pd.read_csv("tumour_zscore_clusters.csv")
-target_col = "Subtype" if "Subtype" in df.columns else "cluster"
-
-le = LabelEncoder()
-y = le.fit_transform(df[target_col])
-
-target_names = []
-for cls in le.classes_:
-    cls_str = str(cls)
-    if cls_str.isdigit():
-        target_names.append(f"Subtype {cls_str}")
-    else:
-        target_names.append(cls_str.replace("Cluster", "Subtype").replace("cluster", "Subtype"))
-
-n_classes = len(target_names)
-summary_data = []
-
-# ── Evaluate each feature group ───────────────────────────────────
-for group_name, proteins in FEATURE_GROUPS.items():
-    print(f"Running pipeline for feature group: {group_name} ({proteins})")
-
-    X = df[proteins].copy()
-
-    classifiers = {
-        "Random Forest": RandomForestClassifier(
-            n_estimators=100, random_state=42, class_weight="balanced", n_jobs=-1
-        ),
-        "SVM": SVC(
-            kernel="rbf", C=1.0, class_weight="balanced", probability=True, random_state=42
-        ),
-        "XGBoost": XGBClassifier(
-            n_estimators=100, max_depth=3, learning_rate=0.1,
-            objective="multi:softprob" if n_classes > 2 else "binary:logistic",
-            eval_metric="mlogloss", random_state=42, n_jobs=-1, verbosity=0,
-        ),
-        "Logistic Regression": LogisticRegression(
-            C=1.0, class_weight="balanced", random_state=42, max_iter=1000, n_jobs=-1
-        ),
-        "MLP": MLPClassifier(
-            hidden_layer_sizes=(100, 50), activation="relu", solver="adam",
-            max_iter=500, random_state=42, early_stopping=True,
-        ),
-    }
-
-    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    cv_results = {
-        name: {"fold_accs": [], "fold_rocs": [], "all_true": [], "all_pred": [], "all_probs": []}
-        for name in classifiers
-    }
-
-    for train_idx, test_idx in cv.split(X, y):
-        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
-        y_train, y_test = y[train_idx], y[test_idx]
-
-        for name, clf in classifiers.items():
-            clf.fit(X_train, y_train)
-            y_pred = clf.predict(X_test)
-            y_prob = clf.predict_proba(X_test)
-
-            fold_roc = (
-                roc_auc_score(y_test, y_prob[:, 1]) if n_classes == 2
-                else roc_auc_score(y_test, y_prob, multi_class="ovr", average="weighted")
-            )
-
-            cv_results[name]["fold_accs"].append(balanced_accuracy_score(y_test, y_pred))
-            cv_results[name]["fold_rocs"].append(fold_roc)
-            cv_results[name]["all_true"].extend(y_test)
-            cv_results[name]["all_pred"].extend(y_pred)
-            cv_results[name]["all_probs"].extend(y_prob)
-
-    # ── Aggregate, report, and plot per classifier ──────────────────
-    for name, res in cv_results.items():
-        all_true = np.array(res["all_true"])
-        all_pred = np.array(res["all_pred"])
-        all_probs = np.array(res["all_probs"])
-
-        accuracy = accuracy_score(all_true, all_pred)
-        precision, recall, f1, _ = precision_recall_fscore_support(
-            all_true, all_pred, average="weighted", zero_division=0
-        )
-        global_roc = (
-            roc_auc_score(all_true, all_probs[:, 1]) if n_classes == 2
-            else roc_auc_score(all_true, all_probs, multi_class="ovr", average="weighted")
-        )
-
-        # No independent grouping column exists, so each sample is its own bootstrap unit.
-        sample_groups = np.arange(len(all_true))
-        if n_classes == 2:
-            roc_lo, roc_hi, _ = bootstrap_binary_auc_ci(all_true, all_probs[:, 1], sample_groups)
-        else:
-            roc_lo, roc_hi, _ = bootstrap_multiclass_auc_ci(
-                all_true, all_probs, classes=range(n_classes), groups=sample_groups
-            )
-
-        summary_data.append({
-            "Feature Group": group_name,
-            "Model": name,
-            "Weighted Precision": precision,
-            "Weighted Recall": recall,
-            "Weighted F1-Score": f1,
-            "Accuracy": accuracy,
-            "Mean Fold ROC-AUC": np.mean(res["fold_rocs"]),
-            "Global ROC-AUC": global_roc,
-            "Global ROC-AUC 95% CI": f"[{roc_lo:.2f}-{roc_hi:.2f}]",
-            "CV Balanced Accuracy (Mean)": np.mean(res["fold_accs"]),
-            "CV Balanced Accuracy (Std)": np.std(res["fold_accs"]),
-        })
-
-        safe_name = name.replace(" ", "_")
-
-        pd.DataFrame(
-            classification_report(all_true, all_pred, target_names=target_names,
-                                   zero_division=0, output_dict=True)
-        ).T.to_csv(f"{OUTPUT_DIR}/{group_name}_{safe_name}_overall_classification_report.csv")
-
-        # Confusion matrix
-        plt.figure(figsize=(6, 5))
-        sns.heatmap(
-            confusion_matrix(all_true, all_pred, labels=range(n_classes)),
-            annot=True, fmt="d", cmap="Blues",
-            xticklabels=target_names, yticklabels=target_names,
-        )
-        plt.title(f"Confusion Matrix: {name} ({group_name} Features)")
-        plt.ylabel("True Label")
-        plt.xlabel("Predicted Label")
-        plt.tight_layout()
-        plt.savefig(f"{OUTPUT_DIR}/{group_name}_{safe_name}_confusion_matrix.png", dpi=300)
-        plt.close()
-
-        # ROC curve(s)
-        plt.figure(figsize=(7, 6))
-        if n_classes == 2:
-            fpr, tpr, _ = roc_curve(all_true, all_probs[:, 1])
-            plt.plot(fpr, tpr, color="darkorange", lw=2,
-                     label=f"ROC curve (AUC = {auc(fpr, tpr):.2f}) [{roc_lo:.2f}-{roc_hi:.2f}]")
-        else:
-            y_true_bin = label_binarize(all_true, classes=range(n_classes))
-            for i, class_name in enumerate(target_names):
-                fpr, tpr, _ = roc_curve(y_true_bin[:, i], all_probs[:, i])
-                plt.plot(fpr, tpr, lw=2,
-                         label=f"{class_name.replace('Subtype ', 'S-')} (AUC = {auc(fpr, tpr):.2f})")
-            plt.plot([], [], " ", label=f"Overall Weighted AUC = {global_roc:.2f} [{roc_lo:.2f}-{roc_hi:.2f}]")
-
-        plt.plot([0, 1], [0, 1], color="navy", lw=1.5, linestyle="--")
-        plt.xlim([0.0, 1.0])
-        plt.ylim([0.0, 1.05])
-        plt.xlabel("False Positive Rate")
-        plt.ylabel("True Positive Rate")
-        plt.title(f"ROC Curves: {name} ({group_name} Features)")
-        plt.legend(loc="lower right")
-        plt.tight_layout()
-        plt.savefig(f"{OUTPUT_DIR}/{group_name}_{safe_name}_roc_curve.png", dpi=300)
-        plt.close()
-
-        print(f"{name} ({group_name}) — Balanced Acc: {np.mean(res['fold_accs']):.2f} ± "
-              f"{np.std(res['fold_accs']):.2f} | ROC-AUC: {global_roc:.2f} [{roc_lo:.2f}-{roc_hi:.2f}]")
-
-# ── Export master comparison table ─────────────────────────────────
-column_order = [
-    "Feature Group", "Model", "Weighted Precision", "Weighted Recall",
-    "Weighted F1-Score", "Accuracy", "Mean Fold ROC-AUC", "Global ROC-AUC",
-    "Global ROC-AUC 95% CI", "CV Balanced Accuracy (Mean)", "CV Balanced Accuracy (Std)",
-]
-pd.DataFrame(summary_data)[column_order].to_csv(
-    f"{OUTPUT_DIR}/comprehensive_model_performance_summary.csv", index=False
-)
-```
-
-</details>
-
----
-
-## 2. Nested CV Feature Selection Pipeline
-
-Selects features **from scratch inside each outer fold** — this is the rigorous version of Section 1, since it derives its own SFS/RFE panels per fold rather than assuming a fixed panel in advance.
+Selects proteins **from scratch inside each outer fold**, so the selection process itself is never exposed to the test data — this is the discovery step that produced the SFS and RFE protein panels used in Section 2.
 
 **Structure:** Outer 5-fold CV (unbiased performance estimate) → per training fold: filter → impute → scale → select → fit. Feature selection itself uses an inner 5-fold CV.
 
@@ -284,7 +46,7 @@ SFS and RFE each select a target number of features independently, producing two
 
 **Classifiers evaluated per feature set:** Random Forest, SVM, XGBoost.
 
-**Feature stability:** counts how often each protein is selected across the 5 outer folds, to identify consistently informative proteins (e.g. selected in ≥3/5 folds) versus fold-specific noise.
+**Feature stability:** counts how often each protein is selected across the 5 outer folds, to identify consistently informative proteins (e.g. selected in ≥3/5 folds) versus fold-specific noise. **The most stable proteins from this step are what get carried forward as the fixed SFS/RFE panels in Section 2.**
 
 <details>
 <summary>Show code — <code>nested_cv_feature_selection.py</code></summary>
@@ -511,9 +273,251 @@ print("\nPipeline complete. All selection was performed inside CV folds — perf
 
 ---
 
+## 2. Fixed Protein Panel Classification
+
+Takes the SFS and RFE protein panels identified as most stable in Section 1 and locks them in, evaluating them against five classifiers with flat (non-nested) cross-validation. This is the "does the panel we found actually generalize well across model types" step.
+
+**Data:** `tumour_zscore_clusters.csv`; target is `Subtype` or `cluster`, label-encoded.
+
+**Feature panels (carried forward from Section 1's feature stability results):**
+
+| Panel | Proteins |
+|-------|----------|
+| SFS | F8VZS0, Q13885, O95479 |
+| RFE | Q9NR12, Q04206, Q8NCW5 |
+
+**Classifiers:** Random Forest, SVM (RBF), XGBoost, Logistic Regression, MLP — all with balanced class weights where supported.
+
+**Cross-validation:** 5-fold `StratifiedKFold` (`shuffle=True`). Each classifier is trained/evaluated per fold; predictions are aggregated across folds.
+
+**Metrics:** balanced accuracy (per fold), aggregated accuracy, weighted precision/recall/F1, aggregated ROC-AUC (binary or weighted OvR) with a 95% bootstrap CI (1,000 resamples).
+
+<details>
+<summary>Show code — <code>protein_panel_classification.py</code></summary>
+
+```python
+"""
+Fixed protein panel classification.
+
+Compares the two protein panels selected in the nested CV feature
+selection step (SFS, RFE) across five classifiers using flat 5-fold
+stratified cross-validation.
+"""
+
+import os
+import warnings
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import SVC
+from sklearn.linear_model import LogisticRegression
+from sklearn.neural_network import MLPClassifier
+from sklearn.model_selection import StratifiedKFold
+from sklearn.preprocessing import LabelEncoder, label_binarize
+from sklearn.metrics import (
+    classification_report,
+    balanced_accuracy_score,
+    confusion_matrix,
+    roc_auc_score,
+    accuracy_score,
+    precision_recall_fscore_support,
+    roc_curve,
+    auc,
+)
+from xgboost import XGBClassifier
+
+from utils.bootstrap_ci import bootstrap_binary_auc_ci, bootstrap_multiclass_auc_ci
+
+warnings.filterwarnings("ignore")
+
+OUTPUT_DIR = "results"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Panels carried forward from the nested CV feature selection step
+FEATURE_GROUPS = {
+    "SFS": ["F8VZS0", "Q13885", "O95479"],
+    "RFE": ["Q9NR12", "Q04206", "Q8NCW5"],
+}
+
+# ── Load data ────────────────────────────────────────────────────
+df = pd.read_csv("tumour_zscore_clusters.csv")
+target_col = "Subtype" if "Subtype" in df.columns else "cluster"
+
+le = LabelEncoder()
+y = le.fit_transform(df[target_col])
+
+target_names = []
+for cls in le.classes_:
+    cls_str = str(cls)
+    if cls_str.isdigit():
+        target_names.append(f"Subtype {cls_str}")
+    else:
+        target_names.append(cls_str.replace("Cluster", "Subtype").replace("cluster", "Subtype"))
+
+n_classes = len(target_names)
+summary_data = []
+
+# ── Evaluate each feature group ───────────────────────────────────
+for group_name, proteins in FEATURE_GROUPS.items():
+    print(f"Running pipeline for feature group: {group_name} ({proteins})")
+
+    X = df[proteins].copy()
+
+    classifiers = {
+        "Random Forest": RandomForestClassifier(
+            n_estimators=100, random_state=42, class_weight="balanced", n_jobs=-1
+        ),
+        "SVM": SVC(
+            kernel="rbf", C=1.0, class_weight="balanced", probability=True, random_state=42
+        ),
+        "XGBoost": XGBClassifier(
+            n_estimators=100, max_depth=3, learning_rate=0.1,
+            objective="multi:softprob" if n_classes > 2 else "binary:logistic",
+            eval_metric="mlogloss", random_state=42, n_jobs=-1, verbosity=0,
+        ),
+        "Logistic Regression": LogisticRegression(
+            C=1.0, class_weight="balanced", random_state=42, max_iter=1000, n_jobs=-1
+        ),
+        "MLP": MLPClassifier(
+            hidden_layer_sizes=(100, 50), activation="relu", solver="adam",
+            max_iter=500, random_state=42, early_stopping=True,
+        ),
+    }
+
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    cv_results = {
+        name: {"fold_accs": [], "fold_rocs": [], "all_true": [], "all_pred": [], "all_probs": []}
+        for name in classifiers
+    }
+
+    for train_idx, test_idx in cv.split(X, y):
+        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+        y_train, y_test = y[train_idx], y[test_idx]
+
+        for name, clf in classifiers.items():
+            clf.fit(X_train, y_train)
+            y_pred = clf.predict(X_test)
+            y_prob = clf.predict_proba(X_test)
+
+            fold_roc = (
+                roc_auc_score(y_test, y_prob[:, 1]) if n_classes == 2
+                else roc_auc_score(y_test, y_prob, multi_class="ovr", average="weighted")
+            )
+
+            cv_results[name]["fold_accs"].append(balanced_accuracy_score(y_test, y_pred))
+            cv_results[name]["fold_rocs"].append(fold_roc)
+            cv_results[name]["all_true"].extend(y_test)
+            cv_results[name]["all_pred"].extend(y_pred)
+            cv_results[name]["all_probs"].extend(y_prob)
+
+    # ── Aggregate, report, and plot per classifier ──────────────────
+    for name, res in cv_results.items():
+        all_true = np.array(res["all_true"])
+        all_pred = np.array(res["all_pred"])
+        all_probs = np.array(res["all_probs"])
+
+        accuracy = accuracy_score(all_true, all_pred)
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            all_true, all_pred, average="weighted", zero_division=0
+        )
+        global_roc = (
+            roc_auc_score(all_true, all_probs[:, 1]) if n_classes == 2
+            else roc_auc_score(all_true, all_probs, multi_class="ovr", average="weighted")
+        )
+
+        # No independent grouping column exists, so each sample is its own bootstrap unit.
+        sample_groups = np.arange(len(all_true))
+        if n_classes == 2:
+            roc_lo, roc_hi, _ = bootstrap_binary_auc_ci(all_true, all_probs[:, 1], sample_groups)
+        else:
+            roc_lo, roc_hi, _ = bootstrap_multiclass_auc_ci(
+                all_true, all_probs, classes=range(n_classes), groups=sample_groups
+            )
+
+        summary_data.append({
+            "Feature Group": group_name,
+            "Model": name,
+            "Weighted Precision": precision,
+            "Weighted Recall": recall,
+            "Weighted F1-Score": f1,
+            "Accuracy": accuracy,
+            "Mean Fold ROC-AUC": np.mean(res["fold_rocs"]),
+            "Global ROC-AUC": global_roc,
+            "Global ROC-AUC 95% CI": f"[{roc_lo:.2f}-{roc_hi:.2f}]",
+            "CV Balanced Accuracy (Mean)": np.mean(res["fold_accs"]),
+            "CV Balanced Accuracy (Std)": np.std(res["fold_accs"]),
+        })
+
+        safe_name = name.replace(" ", "_")
+
+        pd.DataFrame(
+            classification_report(all_true, all_pred, target_names=target_names,
+                                   zero_division=0, output_dict=True)
+        ).T.to_csv(f"{OUTPUT_DIR}/{group_name}_{safe_name}_overall_classification_report.csv")
+
+        # Confusion matrix
+        plt.figure(figsize=(6, 5))
+        sns.heatmap(
+            confusion_matrix(all_true, all_pred, labels=range(n_classes)),
+            annot=True, fmt="d", cmap="Blues",
+            xticklabels=target_names, yticklabels=target_names,
+        )
+        plt.title(f"Confusion Matrix: {name} ({group_name} Features)")
+        plt.ylabel("True Label")
+        plt.xlabel("Predicted Label")
+        plt.tight_layout()
+        plt.savefig(f"{OUTPUT_DIR}/{group_name}_{safe_name}_confusion_matrix.png", dpi=300)
+        plt.close()
+
+        # ROC curve(s)
+        plt.figure(figsize=(7, 6))
+        if n_classes == 2:
+            fpr, tpr, _ = roc_curve(all_true, all_probs[:, 1])
+            plt.plot(fpr, tpr, color="darkorange", lw=2,
+                     label=f"ROC curve (AUC = {auc(fpr, tpr):.2f}) [{roc_lo:.2f}-{roc_hi:.2f}]")
+        else:
+            y_true_bin = label_binarize(all_true, classes=range(n_classes))
+            for i, class_name in enumerate(target_names):
+                fpr, tpr, _ = roc_curve(y_true_bin[:, i], all_probs[:, i])
+                plt.plot(fpr, tpr, lw=2,
+                         label=f"{class_name.replace('Subtype ', 'S-')} (AUC = {auc(fpr, tpr):.2f})")
+            plt.plot([], [], " ", label=f"Overall Weighted AUC = {global_roc:.2f} [{roc_lo:.2f}-{roc_hi:.2f}]")
+
+        plt.plot([0, 1], [0, 1], color="navy", lw=1.5, linestyle="--")
+        plt.xlim([0.0, 1.0])
+        plt.ylim([0.0, 1.05])
+        plt.xlabel("False Positive Rate")
+        plt.ylabel("True Positive Rate")
+        plt.title(f"ROC Curves: {name} ({group_name} Features)")
+        plt.legend(loc="lower right")
+        plt.tight_layout()
+        plt.savefig(f"{OUTPUT_DIR}/{group_name}_{safe_name}_roc_curve.png", dpi=300)
+        plt.close()
+
+        print(f"{name} ({group_name}) — Balanced Acc: {np.mean(res['fold_accs']):.2f} ± "
+              f"{np.std(res['fold_accs']):.2f} | ROC-AUC: {global_roc:.2f} [{roc_lo:.2f}-{roc_hi:.2f}]")
+
+# ── Export master comparison table ─────────────────────────────────
+column_order = [
+    "Feature Group", "Model", "Weighted Precision", "Weighted Recall",
+    "Weighted F1-Score", "Accuracy", "Mean Fold ROC-AUC", "Global ROC-AUC",
+    "Global ROC-AUC 95% CI", "CV Balanced Accuracy (Mean)", "CV Balanced Accuracy (Std)",
+]
+pd.DataFrame(summary_data)[column_order].to_csv(
+    f"{OUTPUT_DIR}/comprehensive_model_performance_summary.csv", index=False
+)
+```
+
+</details>
+
+---
+
 ## 3. Histopathology Slide/Patient-Level Classification
 
-Classifies tumour subtype from **deep slide-level feature vectors** (extracted via TITAN, stored as `.h5` files), aggregated to the patient level.
+Classifies tumour subtype from **deep slide-level feature vectors** (extracted via TITAN, stored as `.h5` files), aggregated to the patient level. This pipeline is independent of the proteomic panels above — it evaluates a separate, image-derived feature source against the same subtype labels.
 
 **Data:** slide feature files matched to patients via `case_submitter_id`, merged with a cluster/subtype mapping. Multiple slides can belong to one patient.
 
