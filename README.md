@@ -290,7 +290,7 @@ Takes the SFS and RFE protein panels identified as most stable in Section 1 and 
 
 **Cross-validation:** 5-fold `StratifiedKFold` (`shuffle=True`). Each classifier is trained/evaluated per fold; predictions are aggregated across folds.
 
-**Metrics:** balanced accuracy (per fold), aggregated accuracy, weighted precision/recall/F1, aggregated ROC-AUC (binary or weighted OvR) with a 95% bootstrap CI (1,000 resamples).
+**Metrics:** balanced accuracy (per fold), aggregated accuracy, weighted precision/recall/F1, aggregated ROC-AUC (weighted OvR) with a 95% bootstrap CI (1,000 resamples).
 
 <details>
 <summary>Show code — <code>protein_panel_classification.py</code></summary>
@@ -329,7 +329,7 @@ from sklearn.metrics import (
 )
 from xgboost import XGBClassifier
 
-from utils.bootstrap_ci import bootstrap_binary_auc_ci, bootstrap_multiclass_auc_ci
+from utils.bootstrap_ci import  bootstrap_multiclass_auc_ci
 
 warnings.filterwarnings("ignore")
 
@@ -430,10 +430,8 @@ for group_name, proteins in FEATURE_GROUPS.items():
 
         # No independent grouping column exists, so each sample is its own bootstrap unit.
         sample_groups = np.arange(len(all_true))
-        if n_classes == 2:
-            roc_lo, roc_hi, _ = bootstrap_binary_auc_ci(all_true, all_probs[:, 1], sample_groups)
-        else:
-            roc_lo, roc_hi, _ = bootstrap_multiclass_auc_ci(
+       
+        roc_lo, roc_hi, _ = bootstrap_multiclass_auc_ci(
                 all_true, all_probs, classes=range(n_classes), groups=sample_groups
             )
 
@@ -570,7 +568,7 @@ from sklearn.svm import SVC
 from sklearn.utils.class_weight import compute_sample_weight
 from xgboost import XGBClassifier
 
-from utils.bootstrap_ci import bootstrap_binary_auc_ci, bootstrap_multiclass_auc_ci
+from utils.bootstrap_ci import bootstrap_multiclass_auc_ci
 
 warnings.filterwarnings("ignore")
 
@@ -726,9 +724,7 @@ for model_name, clf in models.items():
         all_y_true, all_y_prob, classes, groups=np.array(all_test_patients)
     )
     c2_roc_auc = roc_auc_score(y_true_bin_c2, y_prob_c2)
-    slide_c2_auc_ci_low, slide_c2_auc_ci_high, _ = bootstrap_binary_auc_ci(
-        y_true_bin_c2, y_prob_c2, groups=np.array(all_test_patients)
-    )
+    
 
     slide_comparison_metrics.append({
         "Model": model_name,
@@ -812,9 +808,7 @@ for model_name, clf in models.items():
     pat_true_bin_c2 = (patient_results["true_subtype"] == CLUSTER_OF_INTEREST).astype(int)
     pat_prob_c2 = y_pat_prob[:, unique_clusters.index(CLUSTER_OF_INTEREST)]
     pat_c2_roc_auc = roc_auc_score(pat_true_bin_c2, pat_prob_c2)
-    pat_c2_auc_ci_low, pat_c2_auc_ci_high, _ = bootstrap_binary_auc_ci(
-        pat_true_bin_c2, pat_prob_c2, groups=patient_results.index.values
-    )
+    
 
     patient_comparison_metrics.append({
         "Model": model_name,
@@ -895,28 +889,6 @@ def percentile_ci(values, alpha=CI_ALPHA):
     hi = (1 + alpha) / 2 * 100
     return float(np.percentile(values, lo)), float(np.percentile(values, hi))
 
-
-def bootstrap_binary_auc_ci(y_true, y_score, groups, n_bootstraps=N_BOOTSTRAPS,
-                             alpha=CI_ALPHA, random_state=42):
-    """Block bootstrap 95% CI for a binary ROC-AUC, resampling by `groups`."""
-    rng = np.random.RandomState(random_state)
-    y_true, y_score, groups = np.asarray(y_true), np.asarray(y_score), np.asarray(groups)
-
-    unique_groups = np.unique(groups)
-    group_to_idx = {g: np.where(groups == g)[0] for g in unique_groups}
-
-    aucs = []
-    for _ in range(n_bootstraps):
-        sampled_groups = rng.choice(unique_groups, size=len(unique_groups), replace=True)
-        idx = np.concatenate([group_to_idx[g] for g in sampled_groups])
-        yt = y_true[idx]
-        if len(np.unique(yt)) < 2:
-            continue  # skip resamples missing a class
-        aucs.append(roc_auc_score(yt, y_score[idx]))
-
-    aucs = np.array(aucs)
-    lo, hi = percentile_ci(aucs, alpha)
-    return lo, hi, aucs
 
 
 def bootstrap_multiclass_auc_ci(y_true, y_score, classes, groups, average="weighted",
