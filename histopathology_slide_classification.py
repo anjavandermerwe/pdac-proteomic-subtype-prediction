@@ -23,7 +23,7 @@ from sklearn.svm import SVC
 from sklearn.utils.class_weight import compute_sample_weight
 from xgboost import XGBClassifier
 
-from utils.bootstrap_ci import bootstrap_multiclass_auc_ci
+from bootstrap_ci import bootstrap_multiclass_auc_ci
 
 warnings.filterwarnings("ignore")
 
