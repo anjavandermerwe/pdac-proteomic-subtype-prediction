@@ -93,26 +93,3 @@ print(f"\n{len(pipeline_union)} proteins selected in any fold by either method")
 print(f"{len(overlap)} of them are literature biomarkers: {sorted(overlap)}")
 
 
-def plot_venn(sfs_set, rfe_set, filename):
-    fig, ax = plt.subplots(figsize=(8, 7), dpi=300)
-    venn({"SFS features": sfs_set, "RFE features": rfe_set},
-         cmap=["#377EB8", "#E41A1C"], alpha=0.35, fontsize=11,
-         legend_loc="upper right", fmt="", ax=ax)
-
-    # protein names go inside each region instead of counts
-    regions = [
-        (0.26, sorted(sfs_set - rfe_set), "#1F4E79", "medium"),
-        (0.74, sorted(rfe_set - sfs_set), "#8B0000", "medium"),
-        (0.50, sorted(sfs_set & rfe_set), "#2A2A2A", "bold"),
-    ]
-    for x, names, colour, weight in regions:
-        ax.text(x, 0.58, "\n".join(names), transform=ax.transAxes, ha="center", va="center",
-                fontsize=7.5, color=colour, fontweight=weight)
-
-    plt.tight_layout()
-    plt.subplots_adjust(top=0.85)
-    plt.savefig(filename, dpi=300, bbox_inches="tight")
-    plt.close(fig)
-
-
-plot_venn(sfs_all, rfe_all, "venn_sfs_vs_rfe.png")
