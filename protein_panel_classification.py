@@ -21,7 +21,7 @@ from sklearn.preprocessing import LabelEncoder, label_binarize
 from sklearn.svm import SVC
 from xgboost import XGBClassifier
 
-from utils.bootstrap_ci import bootstrap_multiclass_auc_ci
+from bootstrap_ci import bootstrap_multiclass_auc_ci
 
 warnings.filterwarnings("ignore")
 
