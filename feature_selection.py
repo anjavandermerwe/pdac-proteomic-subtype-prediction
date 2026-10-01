@@ -26,15 +26,6 @@ warnings.filterwarnings("ignore")
 N_SELECT = 3     # proteins picked per fold by each method
 N_PREFILTER = 50 # proteins kept after the ANOVA pre-filter
 
-# literature biomarkers (reviewed UniProt entries only)
-try:
-    marker_df = pd.read_excel("idmapping.xlsx")
-    marker_df = marker_df[marker_df["Reviewed"] == "reviewed"]
-    markers = set(marker_df["Entry"].dropna())
-    print(f"{len(markers)} literature biomarkers loaded")
-except Exception as e:
-    print(f"couldn't load idmapping.xlsx ({e}), continuing without literature overlap")
-    markers = set()
 
 df = pd.read_csv("tumour_zscore_clusters.csv")
 meta_cols = ["cluster", "case_submitter_id", "sample_name"]
@@ -84,12 +75,6 @@ print("\nTop 3 by votes")
 print("SFS:", top_sfs)
 print("RFE:", top_rfe)
 
-print("\nOverlap with literature biomarkers")
-print("SFS top 3:", sorted(markers & set(top_sfs)))
-print("RFE top 3:", sorted(markers & set(top_rfe)))
 
-overlap = markers & pipeline_union
-print(f"\n{len(pipeline_union)} proteins selected in any fold by either method")
-print(f"{len(overlap)} of them are literature biomarkers: {sorted(overlap)}")
 
 
