@@ -1,4 +1,4 @@
-# Tumour Subtype Classification
+# PDAC Proteomic Subtype Classification
 
 Code for predicting tumour subtype from proteomic data and from histopathology whole-slide image features. There are three scripts. The first two work together (feature selection of protein biomarkers, then evaluation of the selected panels). The third is independent and uses image features obtained from the TITAN foundation model, but any WSI-level image features can be used.
 
